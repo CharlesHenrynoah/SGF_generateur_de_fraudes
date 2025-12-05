@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-generator-api
+  namespace: fraud-generator
+  labels:
+    app: fraud-generator-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fraud-generator-api
+  template:
+    metadata:
+      labels:
+        app: fraud-generator-api
+    spec:
+      containers:
+      - name: api
+        image: fraud-generator-api:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8010
+          name: http
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: fraud-generator-secrets
+              key: database-url
+        - name: REDIS_HOST
+          value: "redis-service"
+        - name: S3_ENDPOINT_URL
+          value: "http://minio-service:9000"
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          value: "kafka-service:9092"
+        envFrom:
+        - configMapRef:
+            name: fraud-generator-config
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8010
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8010
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fraud-generator-api-service
+  namespace: fraud-generator
+spec:
+  selector:
+    app: fraud-generator-api
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8010
+  type: ClusterIP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fraud-generator-api-hpa
+  namespace: fraud-generator
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fraud-generator-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80

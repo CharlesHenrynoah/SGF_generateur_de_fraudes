@@ -1,0 +1,33 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fraud-generator-ingress
+  namespace: fraud-generator
+  annotations:
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - fraud-generator.example.com
+    secretName: fraud-generator-tls
+  rules:
+  - host: fraud-generator.example.com
+    http:
+      paths:
+      - path: /v1/generator
+        pathType: Prefix
+        backend:
+          service:
+            name: fraud-generator-api-service
+            port:
+              number: 80
+      - path: /health
+        pathType: Prefix
+        backend:
+          service:
+            name: fraud-generator-api-service
+            port:
+              number: 80

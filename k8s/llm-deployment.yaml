@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-generator-llm
+  namespace: fraud-generator
+  labels:
+    app: fraud-generator-llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fraud-generator-llm
+  template:
+    metadata:
+      labels:
+        app: fraud-generator-llm
+    spec:
+      containers:
+      - name: llm
+        image: fraud-generator-llm:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8011
+          name: http
+        env:
+        - name: REDIS_HOST
+          value: "redis-service"
+        envFrom:
+        - configMapRef:
+            name: fraud-generator-config
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "2000m"
+            nvidia.com/gpu: 1
+          limits:
+            memory: "16Gi"
+            cpu: "4000m"
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: models
+          mountPath: /models
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8011
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8011
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: models-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fraud-generator-llm-service
+  namespace: fraud-generator
+spec:
+  selector:
+    app: fraud-generator-llm
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8011
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: models-pvc
+  namespace: fraud-generator
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: standard
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fraud-generator-llm-hpa
+  namespace: fraud-generator
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fraud-generator-llm
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+  - type: Resource
+    resource:
+      name: nvidia.com/gpu
+      target:
+        type: Utilization
+        averageUtilization: 80
