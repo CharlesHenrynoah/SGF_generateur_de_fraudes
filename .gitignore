@@ -35,8 +35,8 @@ wheels/
 *.swo
 *~
 
-# Models
-models/
+# Modèles ML / checkpoints (racine repo uniquement — ne pas masquer app/models/)
+/models/
 *.bin
 *.safetensors
 *.pt

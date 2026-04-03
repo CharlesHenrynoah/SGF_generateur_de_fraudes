@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 from typing import List, Set, Dict
-from app.models.transaction import Transaction
+from app.models.transaction import FraudScenario, Transaction
 from scipy import stats
 import numpy as np
 
@@ -56,13 +56,15 @@ class ValidationService:
     def _compute_signature(self, transaction: Transaction) -> str:
         """Compute hash signature for deduplication."""
         # Create a signature based on key fields
+        tt = transaction.transaction_type
+        tt_val = tt.value if hasattr(tt, "value") else tt
         signature_data = {
             "user_id": transaction.user_id,
             "amount": transaction.amount,
             "currency": transaction.currency,
             "timestamp": transaction.timestamp.isoformat(),
             "merchant_id": transaction.merchant_id,
-            "transaction_type": transaction.transaction_type.value,
+            "transaction_type": tt_val,
         }
         signature_str = json.dumps(signature_data, sort_keys=True)
         return hashlib.sha256(signature_str.encode()).hexdigest()
@@ -155,7 +157,7 @@ class ValidationService:
             if tx.is_fraud and not tx.fraud_scenarios:
                 logger.warning(f"Fraudulent transaction {tx.transaction_id} missing fraud scenarios")
                 # Add default scenario
-                tx.fraud_scenarios = ["identity_theft"]
+                tx.fraud_scenarios = [FraudScenario.IDENTITY_THEFT]
             
             # Business rule: legitimate transactions should not have fraud scenarios
             if not tx.is_fraud and tx.fraud_scenarios:

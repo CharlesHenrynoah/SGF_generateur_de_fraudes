@@ -1,8 +1,9 @@
-"""LLM service for generating synthetic fraud transactions using OpenAI API."""
+"""LLM service for generating synthetic fraud transactions (Gemini or OpenAI)."""
 import asyncio
 import json
 import logging
-from typing import List, Dict, Optional
+import re
+from typing import List, Dict, Optional, Literal
 from datetime import datetime, timedelta
 import random
 import numpy as np
@@ -11,32 +12,90 @@ from app.models.transaction import Transaction, TransactionType, FraudScenario, 
 
 logger = logging.getLogger(__name__)
 
+Backend = Literal["openai", "gemini", "none"]
+
 
 class LLMService:
-    """Service for generating synthetic transactions using OpenAI API."""
+    """Service for generating synthetic transactions via Gemini or OpenAI."""
     
     def __init__(self):
         self.openai_client = None
         self._initialized = False
+        self._backend: Backend = "none"
     
     async def initialize(self):
-        """Initialize the OpenAI client."""
+        """Initialise le client Gemini ou OpenAI selon LLM_PROVIDER."""
         if self._initialized:
             return
         
+        provider = (settings.llm_provider or "gemini").strip().lower()
         try:
-            if settings.llm_use_openai and settings.openai_api_key:
-                from openai import AsyncOpenAI
-                
-                self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+            if provider == "gemini" and settings.gemini_api_key:
+                import google.generativeai as genai
+                genai.configure(api_key=settings.gemini_api_key)
+                self._backend = "gemini"
                 self._initialized = True
-                logger.info(f"OpenAI client initialized with model: {settings.openai_model}")
+                logger.info(f"Gemini initialisé, modèle: {settings.gemini_model}")
+            elif provider == "openai" and settings.llm_use_openai and settings.openai_api_key:
+                from openai import AsyncOpenAI
+                self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+                self._backend = "openai"
+                self._initialized = True
+                logger.info(f"OpenAI initialisé, modèle: {settings.openai_model}")
             else:
-                logger.warning("OpenAI API key not configured, using rule-based generation")
+                logger.warning("Clé LLM non configurée pour le provider choisi, génération par règles")
+                self._backend = "none"
                 self._initialized = False
         except Exception as e:
-            logger.error(f"Error initializing OpenAI client: {e}")
+            logger.error(f"Erreur d'initialisation LLM: {e}")
+            self._backend = "none"
             self._initialized = False
+
+    async def chat_json_completion(self, system: str, user: str) -> dict:
+        """Appel JSON unifié (CLI RAG / scripts)."""
+        await self.initialize()
+        if not self._initialized or self._backend == "none":
+            raise RuntimeError("LLM non initialisé — vérifiez GEMINI_API_KEY ou OPENAI_API_KEY")
+        if self._backend == "openai":
+            response = await self.openai_client.chat.completions.create(
+                model=settings.openai_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=settings.llm_temperature,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(response.choices[0].message.content)
+        return await self._gemini_json(system, user)
+
+    async def _gemini_json(self, system: str, user: str) -> dict:
+        import google.generativeai as genai
+
+        def _sync() -> dict:
+            genai.configure(api_key=settings.gemini_api_key)
+            model = genai.GenerativeModel(
+                model_name=settings.gemini_model,
+                system_instruction=system,
+            )
+            response = model.generate_content(
+                user,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=settings.llm_temperature,
+                    max_output_tokens=settings.llm_max_tokens,
+                    response_mime_type="application/json",
+                ),
+            )
+            text = (response.text or "").strip()
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                m = re.search(r"\{[\s\S]*\}", text)
+                if m:
+                    return json.loads(m.group(0))
+                raise
+
+        return await asyncio.to_thread(_sync)
     
     async def generate_transactions(
         self,
@@ -97,12 +156,18 @@ class LLMService:
         """Generate a batch of transactions."""
         transactions = []
         
-        # Generate in batches to optimize OpenAI API calls
         for i in range(0, count, batch_size):
             batch_count = min(batch_size, count - i)
             
-            if self._initialized and settings.llm_use_openai:
-                # Use OpenAI API
+            if self._initialized and self._backend == "gemini":
+                batch_txs = await self._generate_with_gemini(
+                    count=batch_count,
+                    is_fraud=is_fraud,
+                    scenarios=scenarios,
+                    request=request,
+                    batch_offset=i
+                )
+            elif self._initialized and self._backend == "openai":
                 batch_txs = await self._generate_with_openai(
                     count=batch_count,
                     is_fraud=is_fraud,
@@ -127,6 +192,60 @@ class LLMService:
                 await asyncio.sleep(0.1)
         
         return transactions
+
+    async def _generate_with_gemini(
+        self,
+        count: int,
+        is_fraud: bool,
+        scenarios: List[FraudScenario],
+        request: GenerateRequest,
+        batch_offset: int
+    ) -> List[Transaction]:
+        """Génère des transactions via l'API Gemini."""
+        try:
+            prompt = self._build_prompt(count, is_fraud, scenarios, request)
+            system = (
+                "You are a data generator that creates realistic financial transaction data "
+                "in JSON format. Always return valid JSON with a 'transactions' array."
+            )
+            try:
+                data = await self._gemini_json(system, prompt)
+                tx_list = data.get("transactions", [])
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON Gemini invalide: {e}")
+                tx_list = []
+            except Exception as e:
+                logger.error(f"Erreur API Gemini: {e}")
+                raise
+
+            transactions = []
+            for idx, tx_data in enumerate(tx_list):
+                try:
+                    tx = self._parse_transaction(
+                        tx_data, request, batch_offset + idx, generation_method="gemini"
+                    )
+                    transactions.append(tx)
+                except Exception as e:
+                    logger.warning(f"Erreur parsing transaction {idx}: {e}")
+                    tx = self._generate_rule_based_transaction(
+                        is_fraud, scenarios, request, batch_offset + idx
+                    )
+                    transactions.append(tx)
+
+            while len(transactions) < count:
+                idx = len(transactions)
+                tx = self._generate_rule_based_transaction(
+                    is_fraud, scenarios, request, batch_offset + idx
+                )
+                transactions.append(tx)
+
+            return transactions[:count]
+
+        except Exception as e:
+            logger.error(f"Erreur Gemini: {e}")
+            return await self._generate_rule_based_batch(
+                count, is_fraud, scenarios, request, batch_offset
+            )
     
     async def _generate_with_openai(
         self,
@@ -176,7 +295,9 @@ class LLMService:
             
             for idx, tx_data in enumerate(tx_list):
                 try:
-                    tx = self._parse_transaction(tx_data, request, batch_offset + idx)
+                    tx = self._parse_transaction(
+                        tx_data, request, batch_offset + idx, generation_method="openai"
+                    )
                     transactions.append(tx)
                 except Exception as e:
                     logger.warning(f"Error parsing transaction {idx}: {e}")
@@ -213,6 +334,12 @@ class LLMService:
         """Build prompt for OpenAI API."""
         scenario_names = [s.value for s in scenarios] if scenarios else ["any"]
         
+        fraud_extra = ""
+        if is_fraud:
+            fraud_extra = """
+- For FRAUD rows: diversify clearly — include some with VERY HIGH amount, some with country from higher-risk regions,
+  some with timestamp between 01:00–05:00 local feel, and mention abnormal velocity or card testing in explanation when relevant.
+"""
         prompt = f"""Generate {count} realistic financial transactions as a JSON array.
 
 Requirements:
@@ -220,6 +347,7 @@ Requirements:
 - Fraud scenarios: {", ".join(scenario_names) if is_fraud else "N/A"}
 - Currency: {request.currency}
 - Countries: {", ".join(request.countries)}
+{fraud_extra}
 - Each transaction must include: transaction_id, user_id, merchant_id (optional), amount, currency, transaction_type, timestamp (ISO format), country, city (optional), ip_address, device_id (optional), card_last4 (optional), is_fraud, fraud_scenarios (array), explanation
 
 Return format:
@@ -253,9 +381,10 @@ Generate exactly {count} transactions. Make them realistic and diverse."""
         self,
         tx_data: dict,
         request: GenerateRequest,
-        index: int
+        index: int,
+        generation_method: str = "openai",
     ) -> Transaction:
-        """Parse transaction data from OpenAI response."""
+        """Parse transaction data from LLM response."""
         # Parse timestamp
         if isinstance(tx_data.get("timestamp"), str):
             timestamp = datetime.fromisoformat(tx_data["timestamp"].replace("Z", "+00:00"))
@@ -295,7 +424,7 @@ Generate exactly {count} transactions. Make them realistic and diverse."""
             explanation=tx_data.get("explanation", "Generated transaction"),
             metadata={
                 "generated_at": datetime.now().isoformat(),
-                "generation_method": "openai"
+                "generation_method": generation_method,
             }
         )
     

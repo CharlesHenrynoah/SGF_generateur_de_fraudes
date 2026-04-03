@@ -6,7 +6,7 @@ import os
 import json
 import random
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import uuid
 
 # Ajouter le répertoire app au path
@@ -19,6 +19,11 @@ from app.services.validation_service import validation_service
 from app.services.storage_service import storage_service
 from app.services.kafka_service import kafka_service
 from app.services.dataset_service import dataset_service
+from app.services.rag_bank_security import (
+    RagFormat,
+    generate_rag_payload,
+    sql_row_from_rag,
+)
 
 try:
     from rich.console import Console
@@ -97,190 +102,105 @@ def select_fraud_scenarios(console=None) -> List[FraudScenario]:
         return selected_scenarios
 
 
-async def generate_complex_transaction(is_fraud: bool) -> Optional[Dict[str, Any]]:
-    """
-    Génère une transaction complexe basée sur un exemple réel du CSV (RAG).
-    """
-    # 1. Récupérer une "graine" du dataset réel
-    if is_fraud:
-        seed_data = dataset_service.get_random_fraud()
+async def generate_complex_transaction(
+    is_fraud: bool, fmt: RagFormat = "hybrid"
+) -> Optional[Dict[str, Any]]:
+    """Génère un payload RAG ; `fmt` = openapi | flat | response | label | hybrid."""
+    return await generate_rag_payload(is_fraud, fmt)
+
+
+def _rag_fraud_display_label(tx: Dict[str, Any], fmt: RagFormat, known_fraud: bool) -> str:
+    if fmt == "hybrid" or fmt == "response":
+        return "yes" if tx.get("decision") == "DENY" else "none"
+    if fmt == "label":
+        return "yes" if tx.get("label") == "fraud" else "none"
+    return "yes" if known_fraud else "none"
+
+
+async def main_rag_mode(
+    count: int,
+    fraud_ratio: float,
+    no_save: bool,
+    console=None,
+    rag_format: RagFormat = "openapi",
+):
+    """Mode RAG : payloads alignés bank-security (voir --rag-format)."""
+    if console and RICH_AVAILABLE:
+        console.print(f"\n🚀 Mode RAG — format [bold]{rag_format}[/bold]")
     else:
-        seed_data = dataset_service.get_random_legit()
+        print(f"\n🚀 Mode RAG — format {rag_format}")
+    print(
+        "   (openapi = OpenAPI §3, flat = decision-engine §1, response = §2, label = case-service §4, hybrid = legacy)\n"
+    )
 
-    # 2. Préparer le prompt avec le format STRICT demandé
-    prompt = f"""
-    You are a financial fraud simulation engine. 
-    Generate a JSON object representing a transaction analysis response.
-    
-    BASE DATA (Use this as context but enrich it significantly):
-    - Amount: {seed_data['amount']}
-    - Type: {seed_data['transaction_type']}
-    - Merchant Category: {seed_data['merchant_category']}
-    - Country: {seed_data['country']}
-    - Hour: {seed_data['hour']}
-    - Is Fraud: {is_fraud}
-    
-    OUTPUT FORMAT (Strict JSON):
-    {{
-      "decision_id": "dec_{str(uuid.uuid4())[:12]}",
-      "decision": "{'DENY' if is_fraud else 'ALLOW'}", 
-      "score": {round(random.uniform(0.85, 0.99) if is_fraud else random.uniform(0.01, 0.15), 2)},
-      "rule_hits": ["list", "of", "rules"],
-      "reasons": ["Human readable reasons"],
-      "latency_ms": {random.randint(20, 100)},
-      "model_version": "gbdt_v1.2.3",
-      "sla": {{ "p95_budget_ms": 100 }},
-      "transaction_context": {{
-        "tenant_id": "bank-fr-001",
-        "idempotency_key": "tx-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:8]}",
-        "event": {{
-          "type": "card_payment",
-          "id": "evt_{str(uuid.uuid4())[:12]}",
-          "ts": "{datetime.now().isoformat()}Z",
-          "amount": {seed_data['amount']},
-          "currency": "EUR",
-          "merchant": {{
-            "id": "merch_{str(uuid.uuid4())[:8]}",
-            "name": "Generate a realistic name based on category '{seed_data['merchant_category']}'",
-            "mcc": "Generate valid 4-digit MCC",
-            "country": "{seed_data['country']}"
-          }},
-          "card": {{
-            "card_id": "card_tok_{str(uuid.uuid4())[:8]}",
-            "type": "{'virtual' if seed_data['transaction_type'] == 'Online' else 'physical'}",
-            "user_id": "user_{seed_data['user_id']}"
-          }},
-          "context": {{
-            "ip": "Generate realistic IP",
-            "geo": "{seed_data['country']}",
-            "device_id": "dev_{str(uuid.uuid4())[:8]}",
-            "channel": "{'web' if seed_data['transaction_type'] == 'Online' else 'pos'}"
-          }},
-          "security": {{
-            "auth_method": "3ds/pin/none",
-            "aml_flag": {str(is_fraud).lower()}
-          }},
-          "kyc": {{
-            "status": "verified",
-            "level": "standard",
-            "confidence": 0.95
-          }}
-        }}
-      }}
-    }}
-    
-    INSTRUCTIONS:
-    - If decision is DENY, provide strong reasons in 'reasons' and 'rule_hits' related to fraud.
-    - If decision is ALLOW, reasons should explain why it's safe.
-    - Make merchant name realistic for the category '{seed_data['merchant_category']}' in country '{seed_data['country']}'.
-    - Ensure JSON is valid.
-    """
-
-    # 3. Appel OpenAI
-    try:
-        response = await llm_service.openai_client.chat.completions.create(
-            model=settings.openai_model,
-            messages=[
-                {"role": "system", "content": "You are a data generator. Output ONLY valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            response_format={"type": "json_object"}
-        )
-        
-        content = response.choices[0].message.content
-        return json.loads(content)
-    except Exception as e:
-        print(f"Error generating: {e}")
-        return None
-
-
-async def main_rag_mode(count: int, fraud_ratio: float, no_save: bool, console=None):
-    """Mode RAG : Génération complexe basée sur les CSV."""
-    print("\n🚀 Mode RAG activé : Génération de transactions complexes basées sur vos CSV...")
-    
-    # Init services
     dataset_service.initialize()
     await llm_service.initialize()
-    
-    # Initialiser la DB seulement si on veut sauvegarder
+
     if not no_save:
         await storage_service.initialize_db()
-    
+
     fraud_count = int(count * fraud_ratio)
     legit_count = count - fraud_count
-    
-    transactions = []
-    
-    # Génération frauduleuse
+
+    records: List[Tuple[Dict[str, Any], bool]] = []
+
     for _ in range(fraud_count):
         print(".", end="", flush=True)
-        tx = await generate_complex_transaction(is_fraud=True)
+        tx = await generate_rag_payload(True, rag_format)
         if tx:
-            transactions.append(tx)
-            
-    # Génération légitime
+            records.append((tx, True))
+
     for _ in range(legit_count):
         print(".", end="", flush=True)
-        tx = await generate_complex_transaction(is_fraud=False)
+        tx = await generate_rag_payload(False, rag_format)
         if tx:
-            transactions.append(tx)
-            
+            records.append((tx, False))
+
     print("\n\n✅ Génération terminée !")
-    
-    # Affichage
-    display_limit = 10 if len(transactions) <= 10 else 3
-    
+
+    display_limit = 10 if len(records) <= 10 else 3
+
     if console and RICH_AVAILABLE:
-        for tx in transactions[:display_limit]:
-            # Extraire la partie contexte (requête pure)
-            tx_context = tx.get('transaction_context', {})
-            
-            # Afficher le JSON de la transaction
-            console.print(Syntax(json.dumps(tx_context, indent=2), "json", theme="monokai", word_wrap=True))
-            
-            # Afficher le statut de fraude
-            is_fraud_status = "yes" if tx.get('decision') == 'DENY' else "none"
-            status_color = "red" if is_fraud_status == "yes" else "green"
-            console.print(f"[{status_color}]fraud : {is_fraud_status}[/{status_color}]")
+        for tx, known_fraud in records[:display_limit]:
+            console.print(Syntax(json.dumps(tx, indent=2, default=str), "json", theme="monokai", word_wrap=True))
+            label = _rag_fraud_display_label(tx, rag_format, known_fraud)
+            status_color = "red" if label == "yes" else "green"
+            console.print(f"[{status_color}]fraud indicator : {label}[/{status_color}]")
             console.print("-" * 40)
-            
-        if len(transactions) > display_limit:
-            console.print(f"[italic]... et {len(transactions) - display_limit} autres transactions (sauvegardées mais non affichées)[/italic]")
-            
+
+        if len(records) > display_limit:
+            console.print(
+                f"[italic]... et {len(records) - display_limit} autres payloads (non affichés)[/italic]"
+            )
+
     else:
-        for tx in transactions[:display_limit]:
-            tx_context = tx.get('transaction_context', {})
-            print(json.dumps(tx_context, indent=2))
-            is_fraud_status = "yes" if tx.get('decision') == 'DENY' else "none"
-            print(f"fraud : {is_fraud_status}")
+        for tx, known_fraud in records[:display_limit]:
+            print(json.dumps(tx, indent=2, default=str))
+            print(f"fraud indicator : {_rag_fraud_display_label(tx, rag_format, known_fraud)}")
             print("-" * 40)
-            
-        if len(transactions) > display_limit:
-            print(f"... et {len(transactions) - display_limit} autres transactions (sauvegardées mais non affichées)")
-        
-    # Sauvegarde spéciale pour le format complexe
+
+        if len(records) > display_limit:
+            print(f"... et {len(records) - display_limit} autres payloads (non affichés)")
+
     if not no_save:
         print("\n💾 Sauvegarde en base de données...")
         saved_count = 0
-        
-        # On doit adapter car la table SQL est plate, et le JSON est complexe.
-        # On va extraire les champs principaux pour les colonnes SQL, et stocker TOUT le JSON dans 'metadata'.
-        
-        # Flag pour savoir si on a réussi avec SQL
         sql_success = False
-        
+
         try:
-            # Tenter d'abord la connexion SQL directe
-            if hasattr(storage_service, 'db_engine') and storage_service.db_engine:
+            if hasattr(storage_service, "db_engine") and storage_service.db_engine:
                 from sqlalchemy import text
+
                 try:
                     with storage_service.db_engine.connect() as conn:
-                        for tx in transactions:
+                        for tx, known_fraud in records:
                             try:
-                                ctx = tx['transaction_context']['event']
-                                
-                                conn.execute(text("""
+                                row = sql_row_from_rag(tx, rag_format, known_fraud)
+                                meta = row.pop("metadata")
+                                params = {**row, "metadata": json.dumps(meta, default=str)}
+                                conn.execute(
+                                    text(
+                                        """
                                     INSERT INTO synthetic_transactions 
                                     (transaction_id, user_id, merchant_id, amount, currency, 
                                      transaction_type, timestamp, country, city, ip_address, 
@@ -292,25 +212,10 @@ async def main_rag_mode(count: int, fraud_ratio: float, no_save: bool, console=N
                                             :is_fraud, :fraud_scenarios, :explanation, 
                                             :batch_id, :metadata::jsonb)
                                     ON CONFLICT (transaction_id) DO NOTHING
-                                """), {
-                                    'transaction_id': ctx['id'],
-                                    'user_id': ctx['card']['user_id'],
-                                    'merchant_id': ctx['merchant']['id'],
-                                    'amount': ctx['amount'],
-                                    'currency': ctx['currency'],
-                                    'transaction_type': ctx['type'],
-                                    'timestamp': ctx['ts'].replace('Z', ''),
-                                    'country': ctx['merchant']['country'],
-                                    'city': None,
-                                    'ip_address': ctx['context']['ip'],
-                                    'device_id': ctx['context']['device_id'],
-                                    'card_last4': None,
-                                    'is_fraud': (tx['decision'] == 'DENY'),
-                                    'fraud_scenarios': tx.get('rule_hits', []),
-                                    'explanation': ", ".join(tx.get('reasons', [])),
-                                    'batch_id': generate_batch_id(),
-                                    'metadata': json.dumps(tx)
-                                })
+                                """
+                                    ),
+                                    params,
+                                )
                                 saved_count += 1
                             except Exception as e:
                                 print(f"Erreur insert SQL transaction: {e}")
@@ -327,43 +232,23 @@ async def main_rag_mode(count: int, fraud_ratio: float, no_save: bool, console=N
             print(f"⚠️ Erreur inattendue SQL: {e}")
             sql_success = False
 
-        # Fallback: Utiliser le client Supabase (HTTP API) si SQL a échoué
         if not sql_success:
-            if hasattr(storage_service, 'supabase') and storage_service.supabase:
+            if hasattr(storage_service, "supabase") and storage_service.supabase:
                 print("🔄 Utilisation de l'API Supabase (fallback)...")
                 try:
-                    # Reset count pour éviter doublons si partiel
-                    saved_count = 0 
-                    for tx in transactions:
-                        ctx = tx['transaction_context']['event']
-                        data = {
-                            'transaction_id': ctx['id'],
-                            'user_id': ctx['card']['user_id'],
-                            'merchant_id': ctx['merchant']['id'],
-                            'amount': ctx['amount'],
-                            'currency': ctx['currency'],
-                            'transaction_type': ctx['type'],
-                            'timestamp': ctx['ts'].replace('Z', ''),
-                            'country': ctx['merchant']['country'],
-                            'is_fraud': (tx['decision'] == 'DENY'),
-                            'fraud_scenarios': tx.get('rule_hits', []),
-                            'explanation': ", ".join(tx.get('reasons', [])),
-                            'batch_id': generate_batch_id(),
-                            'metadata': tx,
-                            # Champs optionnels
-                            'city': None,
-                            'ip_address': ctx['context']['ip'],
-                            'device_id': ctx['context']['device_id'],
-                            'card_last4': None
-                        }
-                        storage_service.supabase.table('synthetic_transactions').insert(data).execute()
+                    saved_count = 0
+                    for tx, known_fraud in records:
+                        row = sql_row_from_rag(tx, rag_format, known_fraud)
+                        meta = row.pop("metadata")
+                        data = {**row, "metadata": meta}
+                        storage_service.supabase.table("synthetic_transactions").insert(data).execute()
                         saved_count += 1
                 except Exception as api_error:
                     print(f"❌ Erreur insertion API Supabase: {api_error}")
             else:
                 print("❌ Impossible de sauvegarder: ni SQL ni API Supabase disponibles.")
 
-        print(f"✓ {saved_count} transactions complexes sauvegardées.")
+        print(f"✓ {saved_count} enregistrements sauvegardés.")
 
 
 async def main_async(
@@ -375,7 +260,8 @@ async def main_async(
     no_save: bool = False,
     no_s3: bool = False,
     no_kafka: bool = False,
-    rag_mode: bool = False
+    rag_mode: bool = False,
+    rag_format: RagFormat = "openapi",
 ):
     """Fonction principale async."""
     console = Console() if RICH_AVAILABLE else None
@@ -383,13 +269,21 @@ async def main_async(
     display_welcome(console)
     
     # Vérifier la configuration
-    if not settings.openai_api_key:
-        error_msg = "❌ Erreur: OPENAI_API_KEY non configurée"
+    provider = (settings.llm_provider or "gemini").strip().lower()
+    if provider == "gemini" and not settings.gemini_api_key:
+        error_msg = "❌ Erreur: GEMINI_API_KEY non configurée (LLM_PROVIDER=gemini)"
         if console:
             console.print(f"[bold red]{error_msg}[/bold red]")
         else:
             print(error_msg)
-        print("Configurez-la dans le fichier .env ou via la variable d'environnement")
+        print("Configurez-la dans le fichier .env")
+        sys.exit(1)
+    if provider == "openai" and not settings.openai_api_key:
+        error_msg = "❌ Erreur: OPENAI_API_KEY non configurée (LLM_PROVIDER=openai)"
+        if console:
+            console.print(f"[bold red]{error_msg}[/bold red]")
+        else:
+            print(error_msg)
         sys.exit(1)
     
     # Vérifier la configuration de la base de données
@@ -424,7 +318,7 @@ async def main_async(
         
     # BRANCHEMENT RAG MODE
     if rag_mode:
-        await main_rag_mode(count, fraud_ratio, no_save, console)
+        await main_rag_mode(count, fraud_ratio, no_save, console, rag_format=rag_format)
         return
 
     # ... (Suite du code existant pour le mode normal) ...
@@ -592,10 +486,16 @@ async def main_async(
         for i, tx in enumerate(transactions[:5], 1):
             print(f"\n  {i}. {tx.transaction_id[:30]}...")
             print(f"     Montant: {tx.amount} {tx.currency}")
-            print(f"     Type: {tx.transaction_type.value}")
+            tt = tx.transaction_type
+            tt_show = tt.value if hasattr(tt, "value") else tt
+            print(f"     Type: {tt_show}")
             print(f"     Fraude: {'✓' if tx.is_fraud else '✗'}")
             if tx.fraud_scenarios:
-                print(f"     Scénarios: {', '.join([s.value for s in tx.fraud_scenarios])}")
+                scen = [
+                    (s.value if hasattr(s, "value") else str(s))
+                    for s in tx.fraud_scenarios
+                ]
+                print(f"     Scénarios: {', '.join(scen)}")
 
 
 def main():
@@ -611,21 +511,30 @@ def main():
     parser.add_argument("--no-save", action="store_true", help="Ne pas sauvegarder en base de données")
     parser.add_argument("--no-s3", action="store_true", help="Ne pas exporter vers S3")
     parser.add_argument("--no-kafka", action="store_true", help="Ne pas publier sur Kafka")
-    parser.add_argument("--rag", action="store_true", help="Mode RAG : Utiliser les données CSV locales et le format JSON complexe")
-    
+    parser.add_argument("--rag", action="store_true", help="Mode RAG : données CSV + payloads bank-security")
+    parser.add_argument(
+        "--rag-format",
+        choices=["openapi", "flat", "response", "label", "hybrid"],
+        default="openapi",
+        help="Format JSON RAG : openapi (§3), flat (§1), response (§2), label (§4), hybrid (legacy)",
+    )
+
     args = parser.parse_args()
-    
-    asyncio.run(main_async(
-        count=args.count,
-        fraud_ratio=args.fraud_ratio,
-        currency=args.currency,
-        countries=args.countries,
-        seed=args.seed,
-        no_save=args.no_save,
-        no_s3=args.no_s3,
-        no_kafka=args.no_kafka,
-        rag_mode=args.rag
-    ))
+
+    asyncio.run(
+        main_async(
+            count=args.count,
+            fraud_ratio=args.fraud_ratio,
+            currency=args.currency,
+            countries=args.countries,
+            seed=args.seed,
+            no_save=args.no_save,
+            no_s3=args.no_s3,
+            no_kafka=args.no_kafka,
+            rag_mode=args.rag,
+            rag_format=args.rag_format,
+        )
+    )
 
 
 if __name__ == "__main__":

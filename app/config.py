@@ -12,13 +12,18 @@ class Settings(BaseSettings):
     api_workers: int = 4
     log_level: str = "INFO"
     
-    # LLM Configuration (OpenAI)
+    # LLM : "gemini" | "openai"
+    llm_provider: str = "gemini"
+    # Google Gemini
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-3.1-flash-lite-preview"
+    # OpenAI (optionnel si LLM_PROVIDER=openai)
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini"  # Modèle économique
+    openai_model: str = "gpt-4o-mini"
     llm_temperature: float = 0.7
-    llm_batch_size: int = 100  # Plus petit pour OpenAI (coût)
+    llm_batch_size: int = 100
     llm_max_tokens: int = 2000
-    llm_use_openai: bool = True  # Utiliser OpenAI au lieu de modèle local
+    llm_use_openai: bool = True  # Ignoré si llm_provider=gemini
     
     # Database (Supabase)
     database_url: str = ""

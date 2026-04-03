@@ -4,8 +4,9 @@ uvicorn[standard]==0.24.0
 pydantic==2.5.0
 pydantic-settings==2.1.0
 
-# LLM & ML (OpenAI)
+# LLM & ML
 openai==1.12.0
+google-generativeai>=0.8.3
 # Optionnel pour fallback local
 # torch==2.1.0
 # transformers==4.35.0
